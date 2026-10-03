@@ -3,8 +3,17 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import math
-# pyrefly: ignore [missing-import]
-import pydirectinput
+import vgamepad as vg
+
+
+
+# ── Analog steering constants ──────────────────────────────────────────────────
+
+# Deadzone: steering angles smaller than this (°) are treated as straight
+DEADZONE_DEG = 5
+
+# Full-lock: steering angles beyond this (°) saturate to ±1.0 stick deflection
+MAX_STEER_DEG = 40
 
 
 
@@ -26,6 +35,16 @@ HAND_CONNECTIONS = [
 
 
 
+# ── Virtual Xbox Controller ────────────────────────────────────────────────────
+
+gamepad = vg.VX360Gamepad()
+
+# Make sure stick starts centred
+gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
+gamepad.update()
+
+
+
 # Load MediaPipe Hand Landmarker
 
 MODEL_PATH = "hand_landmarker.task"
@@ -44,7 +63,7 @@ landmarker = vision.HandLandmarker.create_from_options(options)
 
 neutral_angle = None
 smooth_angle = 0
-current_direction = "STRAIGHT"
+analog_x = 0.0          # current stick X position (-1.0 … +1.0)
 
 
 
@@ -279,45 +298,48 @@ while True:
         )
 
 
-        
-        # Determine Direction
-        
-        if steering_angle > 20:
+        # ── Analog stick mapping ───────────────────────────────────────────────
+        #
+        #  steering_angle > 0  →  hands tilted LEFT  →  steer LEFT  → stick X < 0
+        #  steering_angle < 0  →  hands tilted RIGHT  →  steer RIGHT → stick X > 0
+        #
+        #  1. Apply deadzone  – tiny wobbles produce zero output
+        #  2. Remap remaining range to [-1, +1] relative to MAX_STEER_DEG
+        #  3. Clamp to [-1, +1] so full-lock is always possible
 
-            direction = "LEFT"
-
-        elif steering_angle < -20:
-
-            direction = "RIGHT"
-
+        if abs(steering_angle) < DEADZONE_DEG:
+            raw_x = 0.0
         else:
+            # Remove deadzone offset, then scale
+            sign = 1.0 if steering_angle > 0 else -1.0
+            effective = abs(steering_angle) - DEADZONE_DEG
+            usable_range = MAX_STEER_DEG - DEADZONE_DEG
+            raw_x = sign * (effective / usable_range)
 
+        # Clamp to [-1, +1]
+        raw_x = max(-1.0, min(1.0, raw_x))
+
+        # Invert: positive steering_angle = left turn = negative stick X
+        target_x = -raw_x
+
+        # Smooth the analog output a little (optional, reduces jitter)
+        stick_alpha = 0.3
+        analog_x = stick_alpha * target_x + (1 - stick_alpha) * analog_x
+
+        # Send to virtual controller
+        gamepad.left_joystick_float(
+            x_value_float=analog_x,
+            y_value_float=0.0
+        )
+        gamepad.update()
+
+        # ── Derive direction label for display only ────────────────────────────
+        if steering_angle > DEADZONE_DEG:
+            direction = "LEFT"
+        elif steering_angle < -DEADZONE_DEG:
+            direction = "RIGHT"
+        else:
             direction = "STRAIGHT"
-
-
-        
-        # STEERING KEYBOARD CONTROL
-        
-        if direction != current_direction:
-
-            if direction == "LEFT":
-
-                pydirectinput.keyDown("a")
-                pydirectinput.keyUp("d")
-
-            elif direction == "RIGHT":
-
-                pydirectinput.keyDown("d")
-                pydirectinput.keyUp("a")
-
-            else:
-
-                pydirectinput.keyUp("a")
-                pydirectinput.keyUp("d")
-
-
-            current_direction = direction
-
 
         
         # Display Steering Information
@@ -342,6 +364,29 @@ while True:
             2
         )
 
+        # Analog stick bar visualisation
+        bar_center_x = w // 2
+        bar_y = h - 30
+        bar_half = 100
+        fill_x = int(analog_x * bar_half)
+
+        cv2.rectangle(frame, (bar_center_x - bar_half, bar_y - 10),
+                      (bar_center_x + bar_half, bar_y + 10), (60, 60, 60), -1)
+        cv2.rectangle(frame,
+                      (bar_center_x, bar_y - 8),
+                      (bar_center_x + fill_x, bar_y + 8),
+                      (0, 200, 255), -1)
+        cv2.rectangle(frame, (bar_center_x - bar_half, bar_y - 10),
+                      (bar_center_x + bar_half, bar_y + 10), (200, 200, 200), 1)
+        cv2.putText(frame, f"Stick X: {analog_x:+.2f}",
+                    (bar_center_x - bar_half, bar_y - 15),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+
+    else:
+        # No hands detected – centre the stick
+        analog_x = 0.0
+        gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
+        gamepad.update()
 
 
     cv2.imshow(
@@ -362,10 +407,10 @@ while True:
 
 
 
-# Cleanup
+# Cleanup – centre stick before exit
 
-pydirectinput.keyUp("a")
-pydirectinput.keyUp("d")
+gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
+gamepad.update()
 
 cap.release()
 cv2.destroyAllWindows()
