@@ -3,6 +3,7 @@ import mediapipe as mp
 from mediapipe.tasks import python
 from mediapipe.tasks.python import vision
 import math
+import numpy as np
 import vgamepad as vg
 
 
@@ -64,6 +65,97 @@ landmarker = vision.HandLandmarker.create_from_options(options)
 neutral_angle = None
 smooth_angle = 0
 analog_x = 0.0          # current stick X position (-1.0 … +1.0)
+
+
+
+# ── Virtual Steering Wheel drawing helper ──────────────────────────────────────
+
+def draw_steering_wheel(frame, center, radius, rotation_deg, analog_x, direction):
+    """
+    Draw an animated virtual steering wheel on *frame* in-place.
+
+    Parameters
+    ----------
+    center       : (cx, cy)  – pixel position of the wheel hub
+    radius       : int       – outer radius in pixels
+    rotation_deg : float     – current steering rotation (degrees)
+    analog_x     : float     – stick value in [-1, +1], used for colour tint
+    direction    : str       – 'LEFT' | 'RIGHT' | 'STRAIGHT'
+    """
+    cx, cy = center
+    rot_rad = math.radians(rotation_deg)
+
+    # ── Colour palette based on direction ─────────────────────────────────────
+    if direction == "LEFT":
+        rim_color   = (255, 140,  40)   # warm orange
+        spoke_color = (255, 180,  80)
+        hub_color   = (200, 100,  20)
+    elif direction == "RIGHT":
+        rim_color   = ( 40, 140, 255)   # cool blue
+        spoke_color = ( 80, 180, 255)
+        hub_color   = ( 20, 100, 200)
+    else:
+        rim_color   = ( 50, 220,  80)   # neutral green
+        spoke_color = ( 80, 255, 120)
+        hub_color   = ( 30, 160,  50)
+
+    # ── Semi-transparent backing disc ─────────────────────────────────────────
+    overlay = frame.copy()
+    cv2.circle(overlay, (cx, cy), radius + 4, (15, 15, 15), -1)
+    cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
+
+    # ── Outer rim (thick circle) ───────────────────────────────────────────────
+    rim_thickness = max(6, radius // 8)
+    cv2.circle(frame, (cx, cy), radius, rim_color, rim_thickness)
+
+    # ── Slight 3-D bevel on rim ────────────────────────────────────────────────
+    highlight = tuple(min(255, c + 80) for c in rim_color)
+    shadow    = tuple(max(0,   c - 80) for c in rim_color)
+    cv2.circle(frame, (cx, cy), radius,          highlight, 1)
+    cv2.circle(frame, (cx, cy), radius - rim_thickness + 1, shadow, 1)
+
+    # ── Three spokes at 0°, 120°, 240° (rotated by rot_rad) ──────────────────
+    inner_r = radius // 5          # spoke starts near hub
+    outer_r = radius - rim_thickness // 2
+    spoke_w = max(3, radius // 12)
+
+    for spoke_offset_deg in (0, 120, 240):
+        angle = rot_rad + math.radians(spoke_offset_deg)
+        x1 = int(cx + inner_r * math.cos(angle))
+        y1 = int(cy + inner_r * math.sin(angle))
+        x2 = int(cx + outer_r * math.cos(angle))
+        y2 = int(cy + outer_r * math.sin(angle))
+        cv2.line(frame, (x1, y1), (x2, y2), spoke_color, spoke_w, cv2.LINE_AA)
+
+    # ── Hub cap ────────────────────────────────────────────────────────────────
+    hub_r = max(6, radius // 6)
+    cv2.circle(frame, (cx, cy), hub_r,     hub_color,       -1)
+    cv2.circle(frame, (cx, cy), hub_r,     highlight,        1)
+    cv2.circle(frame, (cx, cy), hub_r - 3, (30, 30, 30),    -1)
+
+    # ── Steering-angle arc indicator around the rim ───────────────────────────
+    #   Draw a coloured arc proportional to how far the wheel is turned.
+    arc_span = int(abs(analog_x) * 135)   # max 135° arc
+    if arc_span > 2:
+        start_angle = int(math.degrees(rot_rad)) - arc_span // 2
+        end_angle   = start_angle + arc_span
+        cv2.ellipse(
+            frame, (cx, cy),
+            (radius + rim_thickness // 2 + 3,
+             radius + rim_thickness // 2 + 3),
+            0, start_angle, end_angle,
+            highlight, 2, cv2.LINE_AA
+        )
+
+    # ── Direction label below the wheel ───────────────────────────────────────
+    label_y = cy + radius + rim_thickness + 18
+    font_scale = max(0.45, radius / 90.0)
+    cv2.putText(
+        frame, direction,
+        (cx - 30, label_y),
+        cv2.FONT_HERSHEY_DUPLEX, font_scale,
+        rim_color, 1, cv2.LINE_AA
+    )
 
 
 
@@ -389,13 +481,38 @@ while True:
         gamepad.update()
 
 
+    # ── Draw virtual steering wheel overlay ───────────────────────────────────
+    # Position: bottom-right corner, sized ~18 % of frame width
+    wheel_radius = max(55, int(w * 0.13))
+    wheel_cx = w - wheel_radius - 20
+    wheel_cy = h - wheel_radius - 20
+
+    # Determine direction for colouring even when both hands aren't detected
+    if left_wrist is not None and right_wrist is not None:
+        disp_direction = direction          # set during steering block
+        disp_analog    = analog_x
+        disp_rotation  = -(smooth_angle - (neutral_angle if neutral_angle else smooth_angle))
+    else:
+        disp_direction = "STRAIGHT"
+        disp_analog    = 0.0
+        disp_rotation  = 0.0
+
+    draw_steering_wheel(
+        frame,
+        center=(wheel_cx, wheel_cy),
+        radius=wheel_radius,
+        rotation_deg=disp_rotation,
+        analog_x=disp_analog,
+        direction=disp_direction,
+    )
+
     cv2.imshow(
-        "Hand Tracking",
+        "Virtual Steering Wheel",
         frame
     )
 
     cv2.resizeWindow(
-        "Hand Tracking",
+        "Virtual Steering Wheel",
         640,
         480
     )
