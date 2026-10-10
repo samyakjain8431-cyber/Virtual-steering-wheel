@@ -5,6 +5,7 @@ from mediapipe.tasks.python import vision
 import math
 import numpy as np
 import vgamepad as vg
+from pynput.keyboard import Key, Controller as KeyboardController
 
 
 
@@ -15,6 +16,23 @@ DEADZONE_DEG = 5
 
 # Full-lock: steering angles beyond this (°) saturate to ±1.0 stick deflection
 MAX_STEER_DEG = 40
+
+
+
+# ── Hand gesture (accelerate / brake) constants ────────────────────────────────
+
+# Fingertip landmark indices (thumb, index, middle, ring, pinky)
+FINGERTIP_IDS = [4, 8, 12, 16, 20]
+
+# Ratio of (avg fingertip-to-wrist distance) / (hand span from wrist to middle-MCP)
+# Below FIST_THRESHOLD  → fist  (accelerate)
+# Above OPEN_THRESHOLD  → open  (brake)
+# Between the two       → neutral (coasting)
+FIST_THRESHOLD = 0.65   # tweak if needed
+OPEN_THRESHOLD = 0.85   # tweak if needed
+
+# How many consecutive frames the gesture must hold before it fires
+GESTURE_HOLD_FRAMES = 4
 
 
 
@@ -44,6 +62,22 @@ gamepad = vg.VX360Gamepad()
 gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
 gamepad.update()
 
+# ── Keyboard controller for W / S key simulation ──────────────────────────────
+kb = KeyboardController()
+
+# Track which keys are currently held so we don't spam press/release
+_key_held = {'w': False, 's': False}
+
+def set_key(key_char: str, pressed: bool):
+    """Press or release a single key only when its state actually changes."""
+    if _key_held[key_char] == pressed:
+        return          # already in the right state
+    if pressed:
+        kb.press(key_char)
+    else:
+        kb.release(key_char)
+    _key_held[key_char] = pressed
+
 
 
 # Load MediaPipe Hand Landmarker
@@ -65,6 +99,13 @@ landmarker = vision.HandLandmarker.create_from_options(options)
 neutral_angle = None
 smooth_angle = 0
 analog_x = 0.0          # current stick X position (-1.0 … +1.0)
+
+# ── Gesture state ──────────────────────────────────────────────────────────────
+# Per-hand gesture vote each frame: 'FIST' | 'OPEN' | 'NEUTRAL'
+gesture_votes   = []          # collected across both hands each frame
+gesture_counter = {'FIST': 0, 'OPEN': 0, 'NEUTRAL': 0}  # rolling hold counts
+current_gesture = 'NEUTRAL'   # last committed gesture
+smooth_trigger  = 0.0         # smoothed trigger value sent to gamepad
 
 
 
@@ -159,6 +200,57 @@ def draw_steering_wheel(frame, center, radius, rotation_deg, analog_x, direction
 
 
 
+
+# ── Gesture detection helper ───────────────────────────────────────────────────
+
+def classify_hand_gesture(hand_landmarks, frame_w, frame_h):
+    """
+    Return 'FIST', 'OPEN', or 'NEUTRAL' for a single hand.
+
+    Strategy
+    --------
+    Compute the ratio:
+        avg_tip_dist / hand_scale
+    where
+        avg_tip_dist = mean Euclidean distance (px) from each fingertip to wrist
+        hand_scale   = distance (px) from wrist (0) to middle-finger MCP (9)
+
+    Small ratio → fingers curled → FIST
+    Large ratio → fingers extended → OPEN
+    """
+    wrist = hand_landmarks[0]
+    wx = wrist.x * frame_w
+    wy = wrist.y * frame_h
+
+    # Hand scale: wrist → middle-finger MCP (landmark 9)
+    mid_mcp = hand_landmarks[9]
+    scale = math.hypot(
+        (mid_mcp.x * frame_w) - wx,
+        (mid_mcp.y * frame_h) - wy
+    )
+    if scale < 1e-6:          # degenerate hand – skip
+        return 'NEUTRAL'
+
+    # Average fingertip distance from wrist
+    tip_distances = []
+    for tip_id in FINGERTIP_IDS:
+        tip = hand_landmarks[tip_id]
+        d = math.hypot(
+            (tip.x * frame_w) - wx,
+            (tip.y * frame_h) - wy
+        )
+        tip_distances.append(d)
+
+    ratio = (sum(tip_distances) / len(tip_distances)) / scale
+
+    if ratio < FIST_THRESHOLD:
+        return 'FIST'
+    elif ratio > OPEN_THRESHOLD:
+        return 'OPEN'
+    else:
+        return 'NEUTRAL'
+
+
 cap = cv2.VideoCapture(0)
 
 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
@@ -199,6 +291,7 @@ while True:
 
     left_wrist = None
     right_wrist = None
+    gesture_votes = []   # reset each frame
 
 
     
@@ -305,6 +398,11 @@ while True:
             else:
 
                 right_wrist = (wrist_x, wrist_y)
+
+
+            # ── Classify gesture for this hand ────────────────────────────────
+            gesture = classify_hand_gesture(hand, w, h)
+            gesture_votes.append(gesture)
 
 
     
@@ -481,6 +579,132 @@ while True:
         gamepad.update()
 
 
+    # ── Aggregate gesture votes from both hands ────────────────────────────────
+    # Majority vote across detected hands this frame
+    if gesture_votes:
+        fist_count = gesture_votes.count('FIST')
+        open_count = gesture_votes.count('OPEN')
+        if fist_count > open_count:
+            frame_gesture = 'FIST'
+        elif open_count > fist_count:
+            frame_gesture = 'OPEN'
+        else:
+            frame_gesture = 'NEUTRAL'
+    else:
+        frame_gesture = 'NEUTRAL'
+
+    # Hysteresis: require GESTURE_HOLD_FRAMES consecutive frames
+    for g in ('FIST', 'OPEN', 'NEUTRAL'):
+        if g == frame_gesture:
+            gesture_counter[g] = min(
+                gesture_counter[g] + 1, GESTURE_HOLD_FRAMES
+            )
+        else:
+            gesture_counter[g] = max(gesture_counter[g] - 1, 0)
+
+    if gesture_counter['FIST'] >= GESTURE_HOLD_FRAMES:
+        current_gesture = 'FIST'
+    elif gesture_counter['OPEN'] >= GESTURE_HOLD_FRAMES:
+        current_gesture = 'OPEN'
+    else:
+        current_gesture = 'NEUTRAL'
+
+    # ── Map gesture → keyboard W / S  +  gamepad triggers ───────────────────
+    #   FIST    : hold W  (accelerate)    + right trigger 255
+    #   NEUTRAL : hold W  (accelerate)    + right trigger 255  (always gas)
+    #   OPEN    : hold S  (brake/reverse) + left  trigger 255
+    TARGET_ACCEL = 255
+    TARGET_BRAKE = 255
+
+    if current_gesture == 'OPEN':
+        target_trigger = -TARGET_BRAKE
+        set_key('w', False)
+        set_key('s', True)
+    else:
+        # FIST or NEUTRAL → always accelerate
+        target_trigger = TARGET_ACCEL
+        set_key('w', True)
+        set_key('s', False)
+
+    # Smooth & send gamepad triggers (works for gamepad-compatible games)
+    trigger_alpha = 0.25
+    smooth_trigger = trigger_alpha * target_trigger + (1 - trigger_alpha) * smooth_trigger
+
+    rt_val = int(max(0, smooth_trigger))
+    lt_val = int(max(0, -smooth_trigger))
+
+    gamepad.right_trigger(value=rt_val)
+    gamepad.left_trigger(value=lt_val)
+    gamepad.update()
+
+    # ── Gesture HUD ───────────────────────────────────────────────────────────
+    gest_colors = {
+        'FIST':    (0,   255,  80),   # green  → accelerating
+        'OPEN':    (0,   80,  255),   # blue -> braking
+        'NEUTRAL': (0,   220,  80),   # green -> accelerating (same as FIST)
+    }
+    gest_labels = {
+        'FIST':    '[FIST]  ACCELERATE',
+        'OPEN':    '[OPEN]  BRAKE',
+        'NEUTRAL': '[AUTO]  ACCELERATE',
+    }
+    gest_col = gest_colors[current_gesture]
+    gest_lbl = gest_labels[current_gesture]
+
+    cv2.putText(
+        frame, gest_lbl,
+        (10, 210),
+        cv2.FONT_HERSHEY_DUPLEX, 0.65,
+        gest_col, 1, cv2.LINE_AA
+    )
+
+    # Pedal bar (vertical, right side of frame)
+    bar_top    = 60
+    bar_bottom = h - 60
+    bar_height = bar_bottom - bar_top
+    bar_x      = w - 30
+
+    # Background track
+    cv2.rectangle(
+        frame,
+        (bar_x - 10, bar_top),
+        (bar_x + 10, bar_bottom),
+        (40, 40, 40), -1
+    )
+    cv2.rectangle(
+        frame,
+        (bar_x - 10, bar_top),
+        (bar_x + 10, bar_bottom),
+        (120, 120, 120), 1
+    )
+
+    # Throttle fill (green, grows upward from centre)
+    if rt_val > 0:
+        fill_h = int((rt_val / 255.0) * (bar_height // 2))
+        cv2.rectangle(
+            frame,
+            (bar_x - 8, bar_top + bar_height // 2 - fill_h),
+            (bar_x + 8, bar_top + bar_height // 2),
+            (0, 220, 80), -1
+        )
+
+    # Brake fill (blue, grows downward from centre)
+    if lt_val > 0:
+        fill_h = int((lt_val / 255.0) * (bar_height // 2))
+        cv2.rectangle(
+            frame,
+            (bar_x - 8, bar_top + bar_height // 2),
+            (bar_x + 8, bar_top + bar_height // 2 + fill_h),
+            (0, 80, 220), -1
+        )
+
+    # Labels
+    cv2.putText(frame, 'GAS',   (bar_x - 14, bar_top - 8),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 220, 80), 1)
+    cv2.putText(frame, 'BRK',   (bar_x - 14, bar_bottom + 16),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.38, (0, 80, 220), 1)
+
+
     # ── Draw virtual steering wheel overlay ───────────────────────────────────
     # Position: bottom-right corner, sized ~18 % of frame width
     wheel_radius = max(55, int(w * 0.13))
@@ -524,8 +748,13 @@ while True:
 
 
 
-# Cleanup – centre stick before exit
+# Cleanup – release keys, centre stick, close everything
 
+set_key('w', False)
+set_key('s', False)
+
+gamepad.right_trigger(value=0)
+gamepad.left_trigger(value=0)
 gamepad.left_joystick_float(x_value_float=0.0, y_value_float=0.0)
 gamepad.update()
 
